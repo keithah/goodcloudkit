@@ -47,10 +47,28 @@ public struct RelayHTTPClient: Sendable {
         var req = URLRequest(url: try url(forTargetPath: targetPath))
         req.httpShouldHandleCookies = true
         do {
-            let (data, resp) = try await urlSession.data(for: req)
+            let (data, resp) = try await urlSession.data(for: req, delegate: RedirectPolicy())
             guard let http = resp as? HTTPURLResponse else { throw GoodCloudError.relayUnavailable }
             return (data, http)
         } catch let e as URLError { throw GoodCloudError.transport(e) }
+    }
+
+    /// Whether a redirect should be followed. We follow the relay's own `rttys-ssh → rttys-web`
+    /// hop (a `goodcloud.xyz` host), but NOT a redirect the *proxied target* emits — e.g. the GL
+    /// admin UI 302-ing to `http://192.168.8.1`. Following that unreachable LAN address would
+    /// surface as `.transport(-1004)`; instead we stop and return the 3xx to the caller.
+    static func shouldFollowRedirect(toHost host: String?) -> Bool {
+        guard let host, !host.isEmpty else { return false }
+        return host == "goodcloud.xyz" || host.hasSuffix(".goodcloud.xyz")
+    }
+
+    /// Per-task delegate enforcing `shouldFollowRedirect`.
+    private final class RedirectPolicy: NSObject, URLSessionTaskDelegate {
+        func urlSession(_ session: URLSession, task: URLSessionTask,
+                        willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
+                        completionHandler: @escaping (URLRequest?) -> Void) {
+            completionHandler(RelayHTTPClient.shouldFollowRedirect(toHost: request.url?.host) ? request : nil)
+        }
     }
 
     /// Installs the relay auth cookies for `.goodcloud.xyz` so they are sent to every rttys

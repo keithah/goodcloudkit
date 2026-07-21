@@ -47,6 +47,10 @@ final class RequestSignerTests: XCTestCase {
 
     func test_encrypt_throwsWhenPlaintextTooLongForKey() {
         let signer = RequestSigner.goodCloud() // 512-bit: max 53 bytes
-        XCTAssertThrowsError(try signer.encrypt(String(repeating: "x", count: 54)))
+        XCTAssertThrowsError(try signer.encrypt(String(repeating: "x", count: 54))) { error in
+            guard let gc = error as? GoodCloudError, case .signing = gc else {
+                return XCTFail("expected .signing, got \(error)")
+            }
+        }
     }
 }

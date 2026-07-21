@@ -4,7 +4,12 @@ import Security
 /// Persists a single Credentials record as a generic-password item,
 /// scoped by `service`. account is the item account; refreshToken is the secret.
 public struct KeychainCredentialStore: CredentialStore {
-    public enum KeychainError: Error, Equatable { case status(OSStatus) }
+    public enum KeychainError: Error, Equatable {
+        case status(OSStatus)
+        /// The item was found (`errSecSuccess`) but its data/attributes couldn't be decoded — a
+        /// distinct case so callers don't see a misleading "status 0 (success)" on a real failure.
+        case decodeFailed
+    }
 
     private let service: String
     public init(service: String = "xyz.goodcloud.GoodCloudKit") {
@@ -28,12 +33,12 @@ public struct KeychainCredentialStore: CredentialStore {
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
         if status == errSecItemNotFound { return nil }
-        guard status == errSecSuccess,
-              let dict = item as? [String: Any],
+        guard status == errSecSuccess else { throw KeychainError.status(status) }
+        guard let dict = item as? [String: Any],
               let data = dict[kSecValueData as String] as? Data,
               let account = dict[kSecAttrAccount as String] as? String,
               let token = String(data: data, encoding: .utf8)
-        else { throw KeychainError.status(status) }
+        else { throw KeychainError.decodeFailed }
         return Credentials(account: account, refreshToken: token)
     }
 

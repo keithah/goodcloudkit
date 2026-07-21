@@ -39,4 +39,12 @@ final class RelayHTTPClientTests: XCTestCase {
         let c = RelayHTTPClient(session: s, urlSession: StubURLProtocol.session())
         do { _ = try await c.get(""); XCTFail() } catch { XCTAssertEqual(error as? GoodCloudError, .relayUnavailable) }
     }
+
+    func test_shouldFollowRedirect_onlyForGoodcloudHosts() {
+        XCTAssertTrue(RelayHTTPClient.shouldFollowRedirect(toHost: "rttys-web-cloud-us.goodcloud.xyz"))
+        XCTAssertTrue(RelayHTTPClient.shouldFollowRedirect(toHost: "goodcloud.xyz"))
+        XCTAssertFalse(RelayHTTPClient.shouldFollowRedirect(toHost: "192.168.8.1"))   // target LAN redirect
+        XCTAssertFalse(RelayHTTPClient.shouldFollowRedirect(toHost: "notgoodcloud.xyz"))  // suffix spoof
+        XCTAssertFalse(RelayHTTPClient.shouldFollowRedirect(toHost: nil))
+    }
 }
