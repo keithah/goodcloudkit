@@ -1,0 +1,33 @@
+{
+  "_note": "SANITIZED sample of GET /cloud-api/cloud/v2/device response. Placeholders replace real values; field set matches observed shape.",
+  "code": 0,
+  "msg": "Success.",
+  "info": {
+    "all_count": 2,
+    "online_count": 1,
+    "offline_count": 1,
+    "deactivated_count": 0,
+    "total": 2,
+    "rows": [
+      {
+        "id": "<DEVICE_ID>",
+        "name": "<DEVICE_NAME>",
+        "description": "",
+        "mac": "<MAC>",
+        "sn": "<SN>",
+        "ddns": "<DDNS>",
+        "model": "e5800",
+        "gl_model": "e5800",
+        "boardInfoModel": "GL.iNet E5800",
+        "firmwareType": "2c",
+        "version": "4.8.5",
+        "ip": "<PUBLIC_IP>",
+        "status": 1,
+        "network_mode": "router",
+        "rtty_web": "<RTTY_WEB>",
+        "rtty_ssh": "<RTTY_SSH>",
+        "hasFirmwareUpdate": false
+      }
+    ]
+  }
+}

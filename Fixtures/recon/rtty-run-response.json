@@ -1,0 +1,15 @@
+{
+  "_note": "SANITIZED sample of POST /cloud-api/cloud/device/v4/{deviceId}/rtty/run response. Placeholders replace real values.",
+  "code": 0,
+  "msg": "Success.",
+  "info": {
+    "token_domain": ".goodcloud.xyz",
+    "url": "https://rttys-<REGION>.goodcloud.xyz/web/<DDNS>/http/127.0.0.1%3A80%2F",
+    "content": {
+      "goodcloud": [],
+      "code": 0,
+      "id": "<SESSION_ID>",
+      "time": 1700000000000
+    }
+  }
+}
