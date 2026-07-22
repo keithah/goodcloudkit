@@ -19,11 +19,49 @@ final class RelayHTTPClientTests: XCTestCase {
         }
     }
 
+    override func setUp() {
+        super.setUp()
+        StubURLProtocol.resetStopLoading()
+    }
+
     override func tearDown() { StubURLProtocol.handler = nil; super.tearDown() }
 
     private func session(relayBase: String, token: String?) -> RemoteAccessSession {
         RemoteAccessSession(baseURL: URL(string: relayBase)!, tokenDomain: ".goodcloud.xyz",
                             sessionID: "s", issuedAtMillis: 1, feToken: token)
+    }
+
+    private func makeClient() -> RelayHTTPClient {
+        RelayHTTPClient(session: session(
+            relayBase: "https://rttys-ssh-cloud-us.goodcloud.xyz/web/demo01/http/127.0.0.1%3A8377%2F",
+            token: "FE-TOK"
+        ), urlSession: StubURLProtocol.session())
+    }
+
+    private func assertThrowsSessionExpired(
+        _ operation: () async throws -> Void,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        do {
+            try await operation()
+            XCTFail("expected sessionExpired", file: file, line: line)
+        } catch {
+            XCTAssertEqual(error as? GoodCloudError, .sessionExpired, file: file, line: line)
+        }
+    }
+
+    private func assertStreamThrowsSessionExpired(
+        _ stream: AsyncThrowingStream<RelayHTTPStreamEvent, Error>,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        do {
+            for try await _ in stream {}
+            XCTFail("expected sessionExpired", file: file, line: line)
+        } catch {
+            XCTAssertEqual(error as? GoodCloudError, .sessionExpired, file: file, line: line)
+        }
     }
 
     func test_url_forTargetPath_encodesHostPortAndPathIntoLastSegment() throws {
@@ -118,5 +156,99 @@ final class RelayHTTPClientTests: XCTestCase {
         XCTAssertFalse(RelayHTTPClient.shouldFollowRedirect(toHost: "192.168.8.1"))   // target LAN redirect
         XCTAssertFalse(RelayHTTPClient.shouldFollowRedirect(toHost: "notgoodcloud.xyz"))  // suffix spoof
         XCTAssertFalse(RelayHTTPClient.shouldFollowRedirect(toHost: nil))
+    }
+
+    func test_stream_emitsResponseThenIncrementalBodyChunks() async throws {
+        StubURLProtocol.handler = { request in
+            XCTAssertEqual(request.httpMethod, "GET")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer wattline-token")
+            return .init(status: 200, data: Data(), headers: ["Content-Type": "text/event-stream"],
+                         chunks: [Data("data: one\n\n".utf8), Data("data: two\n\n".utf8)],
+                         finish: false)
+        }
+        let client = makeClient()
+        let expectedBody = Data("data: one\n\ndata: two\n\n".utf8)
+        let task = Task { () throws -> (HTTPURLResponse, Data) in
+            var iterator = client.stream(
+                method: "GET", path: "/api/v1/events",
+                headers: ["Authorization": "Bearer wattline-token", "Accept": "text/event-stream"]
+            ).makeAsyncIterator()
+            guard let first = try await iterator.next(), let response = first.testResponse else {
+                XCTFail("response must be first")
+                throw GoodCloudError.relayUnavailable
+            }
+            var body = Data()
+            while body.count < expectedBody.count, let event = try await iterator.next() {
+                if let chunk = event.testData { body.append(chunk) }
+            }
+            return (response, body)
+        }
+        let (response, body) = try await task.value
+        task.cancel()
+
+        XCTAssertEqual(response.statusCode, 200)
+        XCTAssertEqual(body, expectedBody)
+    }
+
+    func test_streamCancellationStopsUnderlyingRequest() async throws {
+        StubURLProtocol.handler = { _ in
+            .init(status: 200, data: Data(), headers: ["Content-Type": "text/event-stream"],
+                  finish: false)
+        }
+        let responseReceived = expectation(description: "stream response received")
+        let consumer = Task {
+            var iterator = makeClient().stream(method: "GET", path: "api/v1/events").makeAsyncIterator()
+            guard try await iterator.next()?.testResponse != nil else {
+                return XCTFail("response must be first")
+            }
+            responseReceived.fulfill()
+            _ = try await iterator.next()
+        }
+
+        await fulfillment(of: [responseReceived], timeout: 1)
+        consumer.cancel()
+        _ = await consumer.result
+        for _ in 0..<1_000 where !StubURLProtocol.didStopLoading {
+            await Task.yield()
+        }
+
+        XCTAssertTrue(StubURLProtocol.didStopLoading)
+    }
+
+    func test_requestAndStreamMapRelayErrorPageToSessionExpired() async {
+        StubURLProtocol.handler = { _ in
+            .init(status: 404, data: Data(), headers: [:],
+                  responseURL: URL(string: "https://rttys-web-cloud-us.goodcloud.xyz/gl-rtty/error.html"))
+        }
+        await assertThrowsSessionExpired { _ = try await self.makeClient().get("api/v1/status") }
+        await assertStreamThrowsSessionExpired(self.makeClient().stream(method: "GET", path: "api/v1/events"))
+    }
+
+    func test_requestAndStreamPreserveOrdinaryTarget404() async throws {
+        StubURLProtocol.handler = { _ in
+            .init(status: 404, data: Data("missing".utf8), headers: [:])
+        }
+
+        let (data, response) = try await makeClient().get("api/v1/missing")
+        XCTAssertEqual(response.statusCode, 404)
+        XCTAssertEqual(data, Data("missing".utf8))
+
+        var iterator = makeClient().stream(method: "GET", path: "api/v1/missing").makeAsyncIterator()
+        guard let streamResponse = try await iterator.next()?.testResponse else {
+            return XCTFail("response must be first")
+        }
+        XCTAssertEqual(streamResponse.statusCode, 404)
+    }
+}
+
+private extension RelayHTTPStreamEvent {
+    var testResponse: HTTPURLResponse? {
+        guard case .response(let response) = self else { return nil }
+        return response
+    }
+
+    var testData: Data? {
+        guard case .data(let data) = self else { return nil }
+        return data
     }
 }

@@ -1,5 +1,10 @@
 import Foundation
 
+public enum RelayHTTPStreamEvent: @unchecked Sendable {
+    case response(HTTPURLResponse)
+    case data(Data)
+}
+
 /// Consumes a provisioned `RemoteAccessSession` to speak HTTP to the LAN target behind an
 /// rtty relay, authenticating with the `gl-rtty-token` cookie captured during provisioning.
 public struct RelayHTTPClient: Sendable {
@@ -39,29 +44,55 @@ public struct RelayHTTPClient: Sendable {
         headers: [String: String] = [:],
         body: Data? = nil
     ) async throws -> (Data, HTTPURLResponse) {
-        // The relay host authenticates via `.goodcloud.xyz` cookies. Verified live: the web
-        // client sets BOTH `gl-rtty-token` and `FE_TOKEN` to the SAME value — the session token
-        // (`gl-rtty-token = V7()` = the FE_TOKEN cookie). The relay URL is on `rttys-ssh-*` and
-        // 302-redirects to `rttys-web-*`; a *manual* Cookie header is stripped on that cross-host
-        // redirect, so we put the cookies in the session's cookie STORE for domain
-        // `.goodcloud.xyz` and URLSession re-sends them per-host across the redirect, like a browser.
-        guard let fe = session.feToken, !fe.isEmpty else { throw GoodCloudError.relayUnavailable }
-        if let storage = urlSession.configuration.httpCookieStorage {
-            setRelayCookies(into: storage)
-        }
-        var request = URLRequest(url: try url(forTargetPath: normalized(path)))
-        request.httpMethod = method
-        request.httpShouldHandleCookies = true
-        for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
-        request.httpBody = body
         do {
+            let request = try makeRequest(method: method, path: path, headers: headers, body: body)
             let (data, response) = try await urlSession.data(for: request, delegate: RedirectPolicy())
             guard let http = response as? HTTPURLResponse else { throw GoodCloudError.relayUnavailable }
+            guard !Self.isExpiredRelay(response: http) else { throw GoodCloudError.sessionExpired }
             return (data, http)
         } catch let error as GoodCloudError {
             throw error
         } catch let error as URLError {
             throw GoodCloudError.transport(error)
+        }
+    }
+
+    public func stream(
+        method: String,
+        path: String,
+        headers: [String: String] = [:],
+        body: Data? = nil
+    ) -> AsyncThrowingStream<RelayHTTPStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let request = try makeRequest(method: method, path: path, headers: headers, body: body)
+                    let (bytes, response) = try await urlSession.bytes(for: request, delegate: RedirectPolicy())
+                    guard let http = response as? HTTPURLResponse else {
+                        throw GoodCloudError.relayUnavailable
+                    }
+                    guard !Self.isExpiredRelay(response: http) else {
+                        throw GoodCloudError.sessionExpired
+                    }
+                    continuation.yield(.response(http))
+                    for try await byte in bytes {
+                        try Task.checkCancellation()
+                        continuation.yield(.data(Data([byte])))
+                    }
+                    continuation.finish()
+                } catch is CancellationError {
+                    continuation.finish()
+                } catch let error as URLError where error.code == .cancelled {
+                    continuation.finish()
+                } catch let error as GoodCloudError {
+                    continuation.finish(throwing: error)
+                } catch let error as URLError {
+                    continuation.finish(throwing: GoodCloudError.transport(error))
+                } catch {
+                    continuation.finish(throwing: GoodCloudError.relayUnavailable)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
         }
     }
 
@@ -83,6 +114,34 @@ public struct RelayHTTPClient: Sendable {
 
     private func normalized(_ path: String) -> String {
         String(path.drop(while: { $0 == "/" }))
+    }
+
+    private func makeRequest(
+        method: String,
+        path: String,
+        headers: [String: String],
+        body: Data?
+    ) throws -> URLRequest {
+        // The relay host authenticates via `.goodcloud.xyz` cookies. Verified live: the web
+        // client sets BOTH `gl-rtty-token` and `FE_TOKEN` to the SAME value — the session token
+        // (`gl-rtty-token = V7()` = the FE_TOKEN cookie). The relay URL is on `rttys-ssh-*` and
+        // 302-redirects to `rttys-web-*`; a *manual* Cookie header is stripped on that cross-host
+        // redirect, so we put the cookies in the session's cookie STORE for domain
+        // `.goodcloud.xyz` and URLSession re-sends them per-host across the redirect, like a browser.
+        guard let fe = session.feToken, !fe.isEmpty else { throw GoodCloudError.relayUnavailable }
+        if let storage = urlSession.configuration.httpCookieStorage {
+            setRelayCookies(into: storage)
+        }
+        var request = URLRequest(url: try url(forTargetPath: normalized(path)))
+        request.httpMethod = method
+        request.httpShouldHandleCookies = true
+        for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
+        request.httpBody = body
+        return request
+    }
+
+    private static func isExpiredRelay(response: HTTPURLResponse) -> Bool {
+        response.url?.path.hasSuffix("/gl-rtty/error.html") == true
     }
 
     /// Whether a redirect should be followed. We follow the relay's own `rttys-ssh → rttys-web`
