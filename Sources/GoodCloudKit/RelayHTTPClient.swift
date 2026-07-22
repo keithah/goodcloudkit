@@ -12,7 +12,9 @@ public struct RelayHTTPClient: Sendable {
     private let urlSession: any RelayURLSessioning
     public init(session: RemoteAccessSession, urlSession: URLSession? = nil) {
         self.session = session
-        self.urlSession = Self.makeIsolatedURLSession(copying: urlSession)
+        self.urlSession = RelayURLSessionBridge(
+            session: Self.makeIsolatedURLSession(copying: urlSession)
+        )
     }
 
     init(session: RemoteAccessSession, transport: any RelayURLSessioning) {
@@ -27,7 +29,11 @@ public struct RelayHTTPClient: Sendable {
     static func makeIsolatedURLSession(copying session: URLSession? = nil) -> URLSession {
         let configuration = session?.configuration ?? .ephemeral
         configuration.httpCookieStorage = URLSessionConfiguration.ephemeral.httpCookieStorage
-        return URLSession(configuration: configuration)
+        return URLSession(
+            configuration: configuration,
+            delegate: session?.delegate,
+            delegateQueue: session?.delegateQueue
+        )
     }
 
     /// Build the relay URL for a target sub-path. The relay path is
@@ -299,22 +305,67 @@ protocol RelayURLSessioning: Sendable {
     ) async throws -> (URLSession.AsyncBytes, URLResponse)
 }
 
-extension URLSession: RelayURLSessioning {
+struct RelayURLSessionBridge: RelayURLSessioning {
+    let session: URLSession
+    let calls: any RelayURLSessionCalling
+
+    init(
+        session: URLSession,
+        calls: any RelayURLSessionCalling = FoundationRelayURLSessionCalls()
+    ) {
+        self.session = session
+        self.calls = calls
+    }
+
     var relayCookieStorage: HTTPCookieStorage? {
-        configuration.httpCookieStorage
+        session.configuration.httpCookieStorage
     }
 
     func data(
         for request: URLRequest,
         delegate: RelayHTTPClient.RedirectPolicy
     ) async throws -> (Data, URLResponse) {
-        try await data(for: request, delegate: delegate as URLSessionTaskDelegate)
+        try await calls.data(using: session, for: request, delegate: delegate)
     }
 
     func bytes(
         for request: URLRequest,
         delegate: RelayHTTPClient.RedirectPolicy
     ) async throws -> (URLSession.AsyncBytes, URLResponse) {
-        try await bytes(for: request, delegate: delegate as URLSessionTaskDelegate)
+        try await calls.bytes(using: session, for: request, delegate: delegate)
+    }
+}
+
+protocol RelayURLSessionCalling: Sendable {
+    func data(
+        using session: URLSession,
+        for request: URLRequest,
+        delegate: RelayHTTPClient.RedirectPolicy?
+    ) async throws -> (Data, URLResponse)
+
+    func bytes(
+        using session: URLSession,
+        for request: URLRequest,
+        delegate: RelayHTTPClient.RedirectPolicy?
+    ) async throws -> (URLSession.AsyncBytes, URLResponse)
+}
+
+struct FoundationRelayURLSessionCalls: RelayURLSessionCalling {
+    func data(
+        using session: URLSession,
+        for request: URLRequest,
+        delegate: RelayHTTPClient.RedirectPolicy?
+    ) async throws -> (Data, URLResponse) {
+        guard let delegate else { return try await session.data(for: request) }
+        return try await session.data(for: request, delegate: delegate)
+    }
+
+    func bytes(
+        using session: URLSession,
+        for request: URLRequest,
+        delegate: RelayHTTPClient.RedirectPolicy?
+    ) async throws -> (URLSession.AsyncBytes, URLResponse) {
+        guard let delegate else { return try await session.bytes(for: request) }
+        return try await session.bytes(for: request, delegate: delegate)
     }
 }

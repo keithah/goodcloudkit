@@ -2,6 +2,7 @@ import XCTest
 @testable import GoodCloudKit
 
 final class RelayHTTPClientTests: XCTestCase {
+    private final class SessionDelegate: NSObject, URLSessionDelegate, @unchecked Sendable {}
     private final class RequestCapture: @unchecked Sendable {
         private let lock = NSLock()
         private var stored: [URLRequest] = []
@@ -19,45 +20,57 @@ final class RelayHTTPClientTests: XCTestCase {
         }
     }
 
-    private final class RedirectLifecycleSession: RelayURLSessioning, @unchecked Sendable {
-        let backing: URLSession
+    private final class RedirectLifecycleCalls: RelayURLSessionCalling, @unchecked Sendable {
+        private let lock = NSLock()
+        private var redirectCallbacks = 0
 
-        init(backing: URLSession) {
-            self.backing = backing
-        }
-
-        var relayCookieStorage: HTTPCookieStorage? {
-            backing.configuration.httpCookieStorage
+        var redirectCallbackCount: Int {
+            lock.withLock { redirectCallbacks }
         }
 
         func data(
+            using session: URLSession,
             for request: URLRequest,
-            delegate: RelayHTTPClient.RedirectPolicy
+            delegate: RelayHTTPClient.RedirectPolicy?
         ) async throws -> (Data, URLResponse) {
-            let (initialData, initialResponse) = try await backing.data(for: requestWithEligibleCookies(request))
+            let (initialData, initialResponse) = try await session.data(
+                for: requestWithEligibleCookies(request, session: session)
+            )
             guard let redirected = await redirectRequest(
-                from: request, response: initialResponse, delegate: delegate
+                from: request, response: initialResponse, delegate: delegate, session: session
             ) else { return (initialData, initialResponse) }
-            return try await backing.data(for: requestWithEligibleCookies(redirected))
+            let (redirectedData, redirectedResponse) = try await session.data(
+                for: requestWithEligibleCookies(redirected, session: session)
+            )
+            guard let third = await redirectRequest(
+                from: redirected,
+                response: redirectedResponse,
+                delegate: delegate,
+                session: session
+            ) else { return (redirectedData, redirectedResponse) }
+            return try await session.data(for: requestWithEligibleCookies(third, session: session))
         }
 
         func bytes(
+            using session: URLSession,
             for request: URLRequest,
-            delegate: RelayHTTPClient.RedirectPolicy
+            delegate: RelayHTTPClient.RedirectPolicy?
         ) async throws -> (URLSession.AsyncBytes, URLResponse) {
-            let (_, initialResponse) = try await backing.data(for: requestWithEligibleCookies(request))
+            let (_, initialResponse) = try await session.data(
+                for: requestWithEligibleCookies(request, session: session)
+            )
             guard let redirected = await redirectRequest(
-                from: request, response: initialResponse, delegate: delegate
+                from: request, response: initialResponse, delegate: delegate, session: session
             ) else {
-                return try await backing.bytes(for: requestWithEligibleCookies(request))
+                return try await session.bytes(for: requestWithEligibleCookies(request, session: session))
             }
-            return try await backing.bytes(for: requestWithEligibleCookies(redirected))
+            return try await session.bytes(for: requestWithEligibleCookies(redirected, session: session))
         }
 
-        private func requestWithEligibleCookies(_ request: URLRequest) -> URLRequest {
+        private func requestWithEligibleCookies(_ request: URLRequest, session: URLSession) -> URLRequest {
             guard
                 let url = request.url,
-                let cookies = relayCookieStorage?.cookies(for: url),
+                let cookies = session.configuration.httpCookieStorage?.cookies(for: url),
                 !cookies.isEmpty
             else { return request }
             var result = request
@@ -70,7 +83,8 @@ final class RelayHTTPClientTests: XCTestCase {
         private func redirectRequest(
             from original: URLRequest,
             response: URLResponse,
-            delegate: RelayHTTPClient.RedirectPolicy
+            delegate: RelayHTTPClient.RedirectPolicy?,
+            session: URLSession
         ) async -> URLRequest? {
             guard
                 let http = response as? HTTPURLResponse,
@@ -78,6 +92,8 @@ final class RelayHTTPClientTests: XCTestCase {
                 let location = http.value(forHTTPHeaderField: "Location"),
                 let destination = URL(string: location, relativeTo: original.url)?.absoluteURL
             else { return nil }
+
+            lock.withLock { redirectCallbacks += 1 }
 
             var foundationRequest = original
             foundationRequest.url = destination
@@ -88,10 +104,11 @@ final class RelayHTTPClientTests: XCTestCase {
                 foundationRequest.setValue(nil, forHTTPHeaderField: "Content-Type")
                 foundationRequest.setValue(nil, forHTTPHeaderField: "Content-Length")
             }
+            guard let delegate else { return foundationRequest }
             return await withCheckedContinuation { continuation in
                 delegate.urlSession(
-                    backing,
-                    task: backing.dataTask(with: original),
+                    session,
+                    task: session.dataTask(with: original),
                     willPerformHTTPRedirection: http,
                     newRequest: foundationRequest
                 ) { continuation.resume(returning: $0) }
@@ -247,6 +264,21 @@ final class RelayHTTPClientTests: XCTestCase {
         XCTAssertFalse(first === second)
         XCTAssertFalse(first === shared)
         XCTAssertFalse(second === shared)
+    }
+
+    func test_isolatedSessionClonePreservesSuppliedDelegateAndQueue() throws {
+        let delegate = SessionDelegate()
+        let queue = OperationQueue()
+        queue.name = "relay-test-delegate-queue"
+        let supplied = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: queue)
+
+        let clone = RelayHTTPClient.makeIsolatedURLSession(copying: supplied)
+
+        XCTAssertTrue(clone.delegate === delegate)
+        XCTAssertTrue(clone.delegateQueue === queue)
+        XCTAssertFalse(clone.configuration.httpCookieStorage === supplied.configuration.httpCookieStorage)
+        clone.invalidateAndCancel()
+        supplied.invalidateAndCancel()
     }
 
     func test_get_throwsWhenNoSessionToken() async {
@@ -410,7 +442,10 @@ final class RelayHTTPClientTests: XCTestCase {
                     relayBase: "https://rttys-ssh-cloud-us.goodcloud.xyz/web/demo01/http/127.0.0.1%3A8377%2F",
                     token: "FE-TOK"
                 ),
-                transport: RedirectLifecycleSession(backing: backing)
+                transport: RelayURLSessionBridge(
+                    session: backing,
+                    calls: RedirectLifecycleCalls()
+                )
             )
 
             _ = try await client.request(
@@ -461,7 +496,10 @@ final class RelayHTTPClientTests: XCTestCase {
                 relayBase: "https://rttys-ssh-cloud-us.goodcloud.xyz/web/demo01/http/127.0.0.1%3A8377%2F",
                 token: "FE-TOK"
             ),
-            transport: RedirectLifecycleSession(backing: StubURLProtocol.session())
+            transport: RelayURLSessionBridge(
+                session: StubURLProtocol.session(),
+                calls: RedirectLifecycleCalls()
+            )
         )
         var received = Data()
         for try await event in client.stream(
@@ -495,7 +533,10 @@ final class RelayHTTPClientTests: XCTestCase {
                 relayBase: "https://rttys-ssh-cloud-us.goodcloud.xyz/web/demo01/http/127.0.0.1%3A8377%2F",
                 token: "FE-TOK"
             ),
-            transport: RedirectLifecycleSession(backing: StubURLProtocol.session())
+            transport: RelayURLSessionBridge(
+                session: StubURLProtocol.session(),
+                calls: RedirectLifecycleCalls()
+            )
         )
 
         let (_, response) = try await client.post(
@@ -506,6 +547,42 @@ final class RelayHTTPClientTests: XCTestCase {
 
         XCTAssertEqual(response.statusCode, 302)
         XCTAssertEqual(capture.requests.count, 1)
+    }
+
+    func test_requestAPIDrivesSecondRedirectCallbackAndStopsAfterRelayHop() async throws {
+        let capture = RequestCapture()
+        StubURLProtocol.handler = { request in
+            capture.append(request)
+            if request.url?.host == "rttys-ssh-cloud-us.goodcloud.xyz" {
+                return .init(
+                    status: 302,
+                    data: Data(),
+                    headers: ["Location": "https://rttys-web-cloud-us.goodcloud.xyz/first"]
+                )
+            }
+            return .init(
+                status: 302,
+                data: Data(),
+                headers: ["Location": "https://rttys-web-cloud-us.goodcloud.xyz/second"]
+            )
+        }
+        let calls = RedirectLifecycleCalls()
+        let client = RelayHTTPClient(
+            session: session(
+                relayBase: "https://rttys-ssh-cloud-us.goodcloud.xyz/web/demo01/http/127.0.0.1%3A8377%2F",
+                token: "FE-TOK"
+            ),
+            transport: RelayURLSessionBridge(session: StubURLProtocol.session(), calls: calls)
+        )
+
+        let (_, response) = try await client.get(
+            "/api/v1/status", headers: ["Authorization": "Bearer wattline-token"]
+        )
+
+        XCTAssertEqual(response.statusCode, 302)
+        XCTAssertEqual(calls.redirectCallbackCount, 2)
+        XCTAssertEqual(capture.requests.count, 2)
+        XCTAssertEqual(capture.requests.last?.url?.path, "/first")
     }
 
     func test_stream_emitsResponseThenIncrementalBodyChunks() async throws {
