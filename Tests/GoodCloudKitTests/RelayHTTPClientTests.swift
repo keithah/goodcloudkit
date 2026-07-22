@@ -38,6 +38,50 @@ final class RelayHTTPClientTests: XCTestCase {
         ), urlSession: StubURLProtocol.session())
     }
 
+    private func originalRelayRequest(method: String, body: Data? = nil) -> URLRequest {
+        var request = URLRequest(url: URL(
+            string: "https://rttys-ssh-cloud-us.goodcloud.xyz/web/demo01/http/127.0.0.1%3A8377%2Fapi%2Fv1%2Fstatus"
+        )!)
+        request.httpMethod = method
+        request.setValue("Bearer wattline-token", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(method, forHTTPHeaderField: "X-Wattline-Request")
+        request.httpBody = body
+        return request
+    }
+
+    private func foundationRedirectRequest(from original: URLRequest, to destination: URL) -> URLRequest {
+        var request = original
+        request.url = destination
+        request.setValue(nil, forHTTPHeaderField: "Authorization")
+        if original.httpMethod == "POST" {
+            request.httpMethod = "GET"
+            request.httpBody = nil
+            request.setValue(nil, forHTTPHeaderField: "Content-Type")
+        }
+        return request
+    }
+
+    private func applyRedirectPolicy(
+        original: URLRequest,
+        responseURL: URL? = nil,
+        destination: URL
+    ) -> URLRequest? {
+        let response = HTTPURLResponse(
+            url: responseURL ?? original.url!, statusCode: 302,
+            httpVersion: "HTTP/1.1", headerFields: ["Location": destination.absoluteString]
+        )!
+        let proposed = foundationRedirectRequest(from: original, to: destination)
+        var result: URLRequest?
+        RelayHTTPClient.RedirectPolicy(originalRequest: original).urlSession(
+            URLSession.shared,
+            task: URLSession.shared.dataTask(with: original),
+            willPerformHTTPRedirection: response,
+            newRequest: proposed
+        ) { result = $0 }
+        return result
+    }
+
     private func assertThrowsSessionExpired(
         _ operation: () async throws -> Void,
         file: StaticString = #filePath,
@@ -150,12 +194,83 @@ final class RelayHTTPClientTests: XCTestCase {
         XCTAssertNil(requests[3].httpBody)
     }
 
-    func test_shouldFollowRedirect_onlyForGoodcloudHosts() {
-        XCTAssertTrue(RelayHTTPClient.shouldFollowRedirect(toHost: "rttys-web-cloud-us.goodcloud.xyz"))
-        XCTAssertTrue(RelayHTTPClient.shouldFollowRedirect(toHost: "goodcloud.xyz"))
-        XCTAssertFalse(RelayHTTPClient.shouldFollowRedirect(toHost: "192.168.8.1"))   // target LAN redirect
-        XCTAssertFalse(RelayHTTPClient.shouldFollowRedirect(toHost: "notgoodcloud.xyz"))  // suffix spoof
-        XCTAssertFalse(RelayHTTPClient.shouldFollowRedirect(toHost: nil))
+    func test_redirectToMatchingRelayWebHostPreservesEveryHTTPMethodHeadersAndBody() async throws {
+        for method in ["GET", "POST", "PUT", "DELETE"] {
+            let capture = RequestCapture()
+            let body = method == "GET" ? nil : Data("body-\(method)".utf8)
+            let original = originalRelayRequest(method: method, body: body)
+            let destination = URL(
+                string: "https://rttys-web-cloud-us.goodcloud.xyz\(original.url!.path)"
+            )!
+            let redirected = try XCTUnwrap(applyRedirectPolicy(
+                original: original,
+                destination: destination
+            ))
+            StubURLProtocol.handler = { request in
+                capture.append(request)
+                return .init(status: 200, data: Data("ok".utf8), headers: [:])
+            }
+            _ = try await StubURLProtocol.session().data(for: redirected)
+
+            let final = try XCTUnwrap(capture.requests.last)
+            XCTAssertEqual(capture.requests.count, 1, method)
+            XCTAssertEqual(final.url?.host, "rttys-web-cloud-us.goodcloud.xyz", method)
+            XCTAssertEqual(final.httpMethod, method, method)
+            XCTAssertEqual(final.value(forHTTPHeaderField: "Authorization"), "Bearer wattline-token", method)
+            XCTAssertEqual(final.value(forHTTPHeaderField: "X-Wattline-Request"), method, method)
+            XCTAssertEqual(final.value(forHTTPHeaderField: "Content-Type"), "application/json", method)
+            XCTAssertEqual(final.httpBody, body, method)
+        }
+    }
+
+    func test_streamRedirectToMatchingRelayWebHostPreservesHeaders() async throws {
+        let capture = RequestCapture()
+        var original = originalRelayRequest(method: "GET")
+        original.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        let policyRequest = try XCTUnwrap(applyRedirectPolicy(
+            original: original,
+            destination: URL(string: "https://rttys-web-cloud-us.goodcloud.xyz/events")!
+        ))
+        StubURLProtocol.handler = { request in
+            capture.append(request)
+            return .init(status: 200, data: Data("data: ready\n\n".utf8), headers: ["Content-Type": "text/event-stream"])
+        }
+        _ = try await StubURLProtocol.session().bytes(for: policyRequest)
+
+        let redirected = try XCTUnwrap(capture.requests.last)
+        XCTAssertEqual(capture.requests.count, 1)
+        XCTAssertEqual(redirected.url?.host, "rttys-web-cloud-us.goodcloud.xyz")
+        XCTAssertEqual(redirected.httpMethod, "GET")
+        XCTAssertEqual(redirected.value(forHTTPHeaderField: "Authorization"), "Bearer wattline-token")
+        XCTAssertEqual(redirected.value(forHTTPHeaderField: "Accept"), "text/event-stream")
+    }
+
+    func test_redirectDoesNotForwardCallerCredentialsToUnexpectedHostOrRelayHop() async throws {
+        for location in [
+            "https://attacker.example/steal",
+            "https://other.goodcloud.xyz/steal",
+            "https://rttys-web-cloud-eu.goodcloud.xyz/steal",
+            "http://rttys-web-cloud-us.goodcloud.xyz/steal",
+            "https://rttys-web-cloud-us.goodcloud.xyz:444/steal",
+            "https://attacker@rttys-web-cloud-us.goodcloud.xyz/steal",
+        ] {
+            let original = originalRelayRequest(method: "POST", body: Data("secret-body".utf8))
+            XCTAssertNil(applyRedirectPolicy(
+                original: original,
+                destination: URL(string: location)!
+            ), location)
+        }
+    }
+
+    func test_redirectFollowsOnlyOneMatchingRelayInternalHop() async throws {
+        let original = originalRelayRequest(method: "GET")
+        let firstDestination = URL(string: "https://rttys-web-cloud-us.goodcloud.xyz/first")!
+        let first = try XCTUnwrap(applyRedirectPolicy(original: original, destination: firstDestination))
+        XCTAssertNil(applyRedirectPolicy(
+            original: original,
+            responseURL: first.url,
+            destination: URL(string: "https://rttys-web-cloud-us.goodcloud.xyz/second")!
+        ))
     }
 
     func test_stream_emitsResponseThenIncrementalBodyChunks() async throws {
@@ -188,6 +303,45 @@ final class RelayHTTPClientTests: XCTestCase {
 
         XCTAssertEqual(response.statusCode, 200)
         XCTAssertEqual(body, expectedBody)
+    }
+
+    func test_streamCoalescesBytesInsteadOfEmittingOneDataEventPerByte() async throws {
+        let body = Data((0..<100).map { UInt8(ascii: $0.isMultiple(of: 10) ? "\n" : "x") })
+        StubURLProtocol.handler = { _ in
+            .init(status: 200, data: body, headers: ["Content-Type": "text/event-stream"])
+        }
+        var iterator = makeClient().stream(method: "GET", path: "api/v1/events").makeAsyncIterator()
+        let first = try await iterator.next()
+        XCTAssertNotNil(first?.testResponse)
+        var received = Data()
+        var dataEventCount = 0
+        while let event = try await iterator.next() {
+            if let data = event.testData {
+                dataEventCount += 1
+                received.append(data)
+            }
+        }
+        XCTAssertEqual(received, body)
+        XCTAssertLessThan(dataEventCount, body.count / 2)
+    }
+
+    func test_streamFailsInsteadOfBufferingUnboundedDataForASlowConsumer() async throws {
+        let body = Data(repeating: UInt8(ascii: "\n"), count: 10_000)
+        StubURLProtocol.handler = { _ in
+            .init(status: 200, data: body, headers: ["Content-Type": "text/event-stream"])
+        }
+        var iterator = makeClient().stream(method: "GET", path: "api/v1/events").makeAsyncIterator()
+        var dataEventCount = 0
+        do {
+            while let event = try await iterator.next() {
+                if event.testData != nil { dataEventCount += 1 }
+                for _ in 0..<10 { await Task.yield() }
+            }
+            XCTFail("expected bounded stream overflow")
+        } catch {
+            XCTAssertEqual(error as? GoodCloudError, .relayUnavailable)
+        }
+        XCTAssertLessThan(dataEventCount, body.count)
     }
 
     func test_streamCancellationStopsUnderlyingRequest() async throws {

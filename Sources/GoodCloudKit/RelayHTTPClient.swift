@@ -46,7 +46,10 @@ public struct RelayHTTPClient: Sendable {
     ) async throws -> (Data, HTTPURLResponse) {
         do {
             let request = try makeRequest(method: method, path: path, headers: headers, body: body)
-            let (data, response) = try await urlSession.data(for: request, delegate: RedirectPolicy())
+            let (data, response) = try await urlSession.data(
+                for: request,
+                delegate: RedirectPolicy(originalRequest: request)
+            )
             guard let http = response as? HTTPURLResponse else { throw GoodCloudError.relayUnavailable }
             guard !Self.isExpiredRelay(response: http) else { throw GoodCloudError.sessionExpired }
             return (data, http)
@@ -63,21 +66,33 @@ public struct RelayHTTPClient: Sendable {
         headers: [String: String] = [:],
         body: Data? = nil
     ) -> AsyncThrowingStream<RelayHTTPStreamEvent, Error> {
-        AsyncThrowingStream { continuation in
+        AsyncThrowingStream(bufferingPolicy: .bufferingOldest(32)) { continuation in
             let task = Task {
                 do {
                     let request = try makeRequest(method: method, path: path, headers: headers, body: body)
-                    let (bytes, response) = try await urlSession.bytes(for: request, delegate: RedirectPolicy())
+                    let (bytes, response) = try await urlSession.bytes(
+                        for: request,
+                        delegate: RedirectPolicy(originalRequest: request)
+                    )
                     guard let http = response as? HTTPURLResponse else {
                         throw GoodCloudError.relayUnavailable
                     }
                     guard !Self.isExpiredRelay(response: http) else {
                         throw GoodCloudError.sessionExpired
                     }
-                    continuation.yield(.response(http))
+                    try Self.yield(.response(http), to: continuation)
+                    var chunk = Data()
+                    chunk.reserveCapacity(16 * 1_024)
                     for try await byte in bytes {
                         try Task.checkCancellation()
-                        continuation.yield(.data(Data([byte])))
+                        chunk.append(byte)
+                        if byte == UInt8(ascii: "\n") || chunk.count == 16 * 1_024 {
+                            try Self.yield(.data(chunk), to: continuation)
+                            chunk.removeAll(keepingCapacity: true)
+                        }
+                    }
+                    if !chunk.isEmpty {
+                        try Self.yield(.data(chunk), to: continuation)
                     }
                     continuation.finish()
                 } catch is CancellationError {
@@ -144,21 +159,74 @@ public struct RelayHTTPClient: Sendable {
         response.url?.path.hasSuffix("/gl-rtty/error.html") == true
     }
 
-    /// Whether a redirect should be followed. We follow the relay's own `rttys-ssh → rttys-web`
-    /// hop (a `goodcloud.xyz` host), but NOT a redirect the *proxied target* emits — e.g. the GL
-    /// admin UI 302-ing to `http://192.168.8.1`. Following that unreachable LAN address would
-    /// surface as `.transport(-1004)`; instead we stop and return the 3xx to the caller.
-    static func shouldFollowRedirect(toHost host: String?) -> Bool {
-        guard let host, !host.isEmpty else { return false }
-        return host == "goodcloud.xyz" || host.hasSuffix(".goodcloud.xyz")
+    private static func yield(
+        _ event: RelayHTTPStreamEvent,
+        to continuation: AsyncThrowingStream<RelayHTTPStreamEvent, Error>.Continuation
+    ) throws {
+        switch continuation.yield(event) {
+        case .enqueued:
+            return
+        case .dropped:
+            throw GoodCloudError.relayUnavailable
+        case .terminated:
+            throw CancellationError()
+        @unknown default:
+            throw GoodCloudError.relayUnavailable
+        }
     }
 
-    /// Per-task delegate enforcing `shouldFollowRedirect`.
-    private final class RedirectPolicy: NSObject, URLSessionTaskDelegate {
+    /// Per-task delegate that permits exactly the relay's first HTTPS `rttys-ssh-*` → matching
+    /// `rttys-web-*` hop. Foundation's synthesized cross-host request is deliberately discarded:
+    /// it rewrites POST to GET and removes caller authorization. Rebuilding from the original
+    /// request preserves Wattline's independent credentials and payload only for this trusted hop.
+    final class RedirectPolicy: NSObject, URLSessionTaskDelegate {
+        private let originalRequest: URLRequest
+
+        init(originalRequest: URLRequest) {
+            self.originalRequest = originalRequest
+        }
+
         func urlSession(_ session: URLSession, task: URLSessionTask,
                         willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
                         completionHandler: @escaping (URLRequest?) -> Void) {
-            completionHandler(RelayHTTPClient.shouldFollowRedirect(toHost: request.url?.host) ? request : nil)
+            guard Self.isExpectedRelayHop(
+                originalURL: originalRequest.url,
+                responseURL: response.url,
+                destinationURL: request.url
+            ) else {
+                completionHandler(nil)
+                return
+            }
+            var preserved = originalRequest
+            preserved.url = request.url
+            completionHandler(preserved)
+        }
+
+        private static func isExpectedRelayHop(
+            originalURL: URL?, responseURL: URL?, destinationURL: URL?
+        ) -> Bool {
+            guard
+                let originalURL,
+                let responseURL,
+                let destinationURL,
+                originalURL.scheme?.lowercased() == "https",
+                responseURL.scheme?.lowercased() == "https",
+                destinationURL.scheme?.lowercased() == "https",
+                originalURL.port == nil || originalURL.port == 443,
+                responseURL.port == originalURL.port,
+                destinationURL.port == originalURL.port,
+                destinationURL.user == nil,
+                destinationURL.password == nil,
+                let originalHost = originalURL.host?.lowercased(),
+                let responseHost = responseURL.host?.lowercased(),
+                let destinationHost = destinationURL.host?.lowercased(),
+                originalHost.hasPrefix("rttys-ssh-"),
+                originalHost.hasSuffix(".goodcloud.xyz"),
+                responseHost == originalHost
+            else { return false }
+
+            let regionSuffix = originalHost.dropFirst("rttys-ssh-".count)
+            return destinationHost == "rttys-web-\(regionSuffix)"
         }
     }
 

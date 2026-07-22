@@ -47,7 +47,20 @@ final class StubURLProtocol: URLProtocol {
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
         guard let handler = Self.handler else { fatalError("StubURLProtocol.handler not set") }
-        let stub = handler(task?.originalRequest ?? request)
+        var currentRequest = request
+        if currentRequest.httpBody == nil, let stream = currentRequest.httpBodyStream {
+            stream.open()
+            defer { stream.close() }
+            var body = Data()
+            var buffer = [UInt8](repeating: 0, count: 4_096)
+            while stream.hasBytesAvailable {
+                let count = stream.read(&buffer, maxLength: buffer.count)
+                guard count > 0 else { break }
+                body.append(buffer, count: count)
+            }
+            currentRequest.httpBody = body
+        }
+        let stub = handler(currentRequest)
         let resp = HTTPURLResponse(url: stub.responseURL ?? request.url!, statusCode: stub.status,
                                    httpVersion: "HTTP/1.1", headerFields: stub.headers)!
         client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
