@@ -22,6 +22,7 @@ final class StubURLProtocol: URLProtocol {
     }
     /// Set before each test. Receives the outgoing request (for assertions) and returns a stub.
     nonisolated(unsafe) static var handler: (@Sendable (URLRequest) -> Stub)?
+    nonisolated(unsafe) static var onStopLoading: (@Sendable () -> Void)?
     private static let stopLock = NSLock()
     nonisolated(unsafe) private static var recordedStopLoading = false
 
@@ -79,5 +80,6 @@ final class StubURLProtocol: URLProtocol {
         Self.stopLock.lock()
         Self.recordedStopLoading = true
         Self.stopLock.unlock()
+        Self.onStopLoading?()
     }
 }

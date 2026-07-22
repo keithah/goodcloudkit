@@ -9,9 +9,25 @@ public enum RelayHTTPStreamEvent: @unchecked Sendable {
 /// rtty relay, authenticating with the `gl-rtty-token` cookie captured during provisioning.
 public struct RelayHTTPClient: Sendable {
     private let session: RemoteAccessSession
-    private let urlSession: URLSession
-    public init(session: RemoteAccessSession, urlSession: URLSession = .shared) {
-        self.session = session; self.urlSession = urlSession
+    private let urlSession: any RelayURLSessioning
+    public init(session: RemoteAccessSession, urlSession: URLSession? = nil) {
+        self.session = session
+        self.urlSession = Self.makeIsolatedURLSession(copying: urlSession)
+    }
+
+    init(session: RemoteAccessSession, transport: any RelayURLSessioning) {
+        self.session = session
+        self.urlSession = transport
+    }
+
+    var relayCookieStorage: HTTPCookieStorage? {
+        urlSession.relayCookieStorage
+    }
+
+    static func makeIsolatedURLSession(copying session: URLSession? = nil) -> URLSession {
+        let configuration = session?.configuration ?? .ephemeral
+        configuration.httpCookieStorage = URLSessionConfiguration.ephemeral.httpCookieStorage
+        return URLSession(configuration: configuration)
     }
 
     /// Build the relay URL for a target sub-path. The relay path is
@@ -141,13 +157,14 @@ public struct RelayHTTPClient: Sendable {
         // client sets BOTH `gl-rtty-token` and `FE_TOKEN` to the SAME value — the session token
         // (`gl-rtty-token = V7()` = the FE_TOKEN cookie). The relay URL is on `rttys-ssh-*` and
         // 302-redirects to `rttys-web-*`; a *manual* Cookie header is stripped on that cross-host
-        // redirect, so we put the cookies in the session's cookie STORE for domain
-        // `.goodcloud.xyz` and URLSession re-sends them per-host across the redirect, like a browser.
+        // redirect, so we install host-only Secure cookies for the exact ssh and matching web
+        // relay hosts. URLSession then sends the eligible cookie at each side of the trusted hop.
         guard let fe = session.feToken, !fe.isEmpty else { throw GoodCloudError.relayUnavailable }
-        if let storage = urlSession.configuration.httpCookieStorage {
-            setRelayCookies(into: storage)
+        let requestURL = try url(forTargetPath: normalized(path))
+        if let storage = urlSession.relayCookieStorage {
+            setRelayCookies(into: storage, originalRelayURL: requestURL)
         }
-        var request = URLRequest(url: try url(forTargetPath: normalized(path)))
+        var request = URLRequest(url: requestURL)
         request.httpMethod = method
         request.httpShouldHandleCookies = true
         for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
@@ -157,6 +174,14 @@ public struct RelayHTTPClient: Sendable {
 
     private static func isExpiredRelay(response: HTTPURLResponse) -> Bool {
         response.url?.path.hasSuffix("/gl-rtty/error.html") == true
+    }
+
+    private static func matchingWebRelayHost(forSSHHost host: String) -> String? {
+        let host = host.lowercased()
+        guard host.hasPrefix("rttys-ssh-"), host.hasSuffix(".goodcloud.xyz") else {
+            return nil
+        }
+        return "rttys-web-\(host.dropFirst("rttys-ssh-".count))"
     }
 
     private static func yield(
@@ -220,26 +245,76 @@ public struct RelayHTTPClient: Sendable {
                 let originalHost = originalURL.host?.lowercased(),
                 let responseHost = responseURL.host?.lowercased(),
                 let destinationHost = destinationURL.host?.lowercased(),
-                originalHost.hasPrefix("rttys-ssh-"),
-                originalHost.hasSuffix(".goodcloud.xyz"),
+                let expectedDestinationHost = RelayHTTPClient.matchingWebRelayHost(forSSHHost: originalHost),
                 responseHost == originalHost
             else { return false }
 
-            let regionSuffix = originalHost.dropFirst("rttys-ssh-".count)
-            return destinationHost == "rttys-web-\(regionSuffix)"
+            return destinationHost == expectedDestinationHost
         }
     }
 
-    /// Installs the relay auth cookies for `.goodcloud.xyz` so they are sent to every rttys
-    /// subdomain, including across the ssh→web redirect.
-    private func setRelayCookies(into storage: HTTPCookieStorage) {
+    /// Installs host-only Secure relay auth cookies for the exact ssh host and its matching web
+    /// redirect host. No other GoodCloud service, subdomain, or plaintext request is eligible.
+    private func setRelayCookies(into storage: HTTPCookieStorage, originalRelayURL: URL) {
+        guard
+            originalRelayURL.scheme?.lowercased() == "https",
+            originalRelayURL.port == nil || originalRelayURL.port == 443,
+            let sshHost = originalRelayURL.host?.lowercased(),
+            let webHost = Self.matchingWebRelayHost(forSSHHost: sshHost)
+        else { return }
+
         // Both cookies carry the same session token (see get(...)).
-        for (name, value) in [("gl-rtty-token", session.feToken), ("FE_TOKEN", session.feToken)] {
-            guard let value, !value.isEmpty,
-                  let cookie = HTTPCookie(properties: [
-                      .name: name, .value: value, .domain: ".goodcloud.xyz", .path: "/",
-                  ]) else { continue }
-            storage.setCookie(cookie)
+        for host in [sshHost, webHost] {
+            var origin = URLComponents()
+            origin.scheme = "https"
+            origin.host = host
+            origin.port = originalRelayURL.port
+            guard let originURL = origin.url else { continue }
+            for (name, value) in [("gl-rtty-token", session.feToken), ("FE_TOKEN", session.feToken)] {
+                guard let value, !value.isEmpty,
+                      let cookie = HTTPCookie(properties: [
+                          .originURL: originURL,
+                          .name: name,
+                          .value: value,
+                          .path: "/",
+                          .secure: "TRUE",
+                      ]) else { continue }
+                storage.setCookie(cookie)
+            }
         }
+    }
+}
+
+protocol RelayURLSessioning: Sendable {
+    var relayCookieStorage: HTTPCookieStorage? { get }
+
+    func data(
+        for request: URLRequest,
+        delegate: RelayHTTPClient.RedirectPolicy
+    ) async throws -> (Data, URLResponse)
+
+    func bytes(
+        for request: URLRequest,
+        delegate: RelayHTTPClient.RedirectPolicy
+    ) async throws -> (URLSession.AsyncBytes, URLResponse)
+}
+
+extension URLSession: RelayURLSessioning {
+    var relayCookieStorage: HTTPCookieStorage? {
+        configuration.httpCookieStorage
+    }
+
+    func data(
+        for request: URLRequest,
+        delegate: RelayHTTPClient.RedirectPolicy
+    ) async throws -> (Data, URLResponse) {
+        try await data(for: request, delegate: delegate as URLSessionTaskDelegate)
+    }
+
+    func bytes(
+        for request: URLRequest,
+        delegate: RelayHTTPClient.RedirectPolicy
+    ) async throws -> (URLSession.AsyncBytes, URLResponse) {
+        try await bytes(for: request, delegate: delegate as URLSessionTaskDelegate)
     }
 }
