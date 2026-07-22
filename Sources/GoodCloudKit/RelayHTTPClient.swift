@@ -33,7 +33,12 @@ public struct RelayHTTPClient: Sendable {
         return url
     }
 
-    public func get(_ targetPath: String) async throws -> (Data, HTTPURLResponse) {
+    public func request(
+        method: String,
+        path: String,
+        headers: [String: String] = [:],
+        body: Data? = nil
+    ) async throws -> (Data, HTTPURLResponse) {
         // The relay host authenticates via `.goodcloud.xyz` cookies. Verified live: the web
         // client sets BOTH `gl-rtty-token` and `FE_TOKEN` to the SAME value — the session token
         // (`gl-rtty-token = V7()` = the FE_TOKEN cookie). The relay URL is on `rttys-ssh-*` and
@@ -44,13 +49,40 @@ public struct RelayHTTPClient: Sendable {
         if let storage = urlSession.configuration.httpCookieStorage {
             setRelayCookies(into: storage)
         }
-        var req = URLRequest(url: try url(forTargetPath: targetPath))
-        req.httpShouldHandleCookies = true
+        var request = URLRequest(url: try url(forTargetPath: normalized(path)))
+        request.httpMethod = method
+        request.httpShouldHandleCookies = true
+        for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
+        request.httpBody = body
         do {
-            let (data, resp) = try await urlSession.data(for: req, delegate: RedirectPolicy())
-            guard let http = resp as? HTTPURLResponse else { throw GoodCloudError.relayUnavailable }
+            let (data, response) = try await urlSession.data(for: request, delegate: RedirectPolicy())
+            guard let http = response as? HTTPURLResponse else { throw GoodCloudError.relayUnavailable }
             return (data, http)
-        } catch let e as URLError { throw GoodCloudError.transport(e) }
+        } catch let error as GoodCloudError {
+            throw error
+        } catch let error as URLError {
+            throw GoodCloudError.transport(error)
+        }
+    }
+
+    public func get(_ path: String, headers: [String: String] = [:]) async throws -> (Data, HTTPURLResponse) {
+        try await request(method: "GET", path: path, headers: headers)
+    }
+
+    public func post(_ path: String, headers: [String: String] = [:], body: Data? = nil) async throws -> (Data, HTTPURLResponse) {
+        try await request(method: "POST", path: path, headers: headers, body: body)
+    }
+
+    public func put(_ path: String, headers: [String: String] = [:], body: Data? = nil) async throws -> (Data, HTTPURLResponse) {
+        try await request(method: "PUT", path: path, headers: headers, body: body)
+    }
+
+    public func delete(_ path: String, headers: [String: String] = [:], body: Data? = nil) async throws -> (Data, HTTPURLResponse) {
+        try await request(method: "DELETE", path: path, headers: headers, body: body)
+    }
+
+    private func normalized(_ path: String) -> String {
+        String(path.drop(while: { $0 == "/" }))
     }
 
     /// Whether a redirect should be followed. We follow the relay's own `rttys-ssh → rttys-web`

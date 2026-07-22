@@ -16,7 +16,7 @@ final class StubURLProtocol: URLProtocol {
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
         guard let handler = Self.handler else { fatalError("StubURLProtocol.handler not set") }
-        let stub = handler(request)
+        let stub = handler(task?.originalRequest ?? request)
         let resp = HTTPURLResponse(url: request.url!, statusCode: stub.status,
                                    httpVersion: "HTTP/1.1", headerFields: stub.headers)!
         client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
