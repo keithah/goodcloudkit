@@ -5,7 +5,7 @@ on:
   pull_request:
 jobs:
   test:
-    runs-on: macos-14
+    runs-on: tenki-macos-15-small
     steps:
       - uses: actions/checkout@v4
       - name: Build
